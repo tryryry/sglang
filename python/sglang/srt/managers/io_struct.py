@@ -86,6 +86,9 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for batched IPC payloads."""
 
     rids: Optional[List[str]] = None
+    # Used by batch messages whose items are parallel arrays, such as scheduler
+    # outputs. Tokenized input batches store routing on batch[i].http_worker_ipc
+    # because the scheduler unpacks them into single-request handlers.
     http_worker_ipcs: Optional[List[Optional[str]]] = None
 
     @classmethod
@@ -153,6 +156,9 @@ class GenerateReqInput:
     # Request ID(s). If omitted, generated during normalization. For batch
     # requests, a string is expanded to per-item IDs using it as a prefix.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    # Stable identity shared by requests in the same session. Unlike
+    # session_params, this does not alter or reconstruct the prompt.
+    session_id: Optional[str] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -292,6 +298,9 @@ class GenerateReqInput:
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
 
+    # For Unlimited-OCR
+    images_config: Optional[dict] = None
+
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
@@ -335,6 +344,8 @@ class GenerateReqInput:
         """
         self._validate_inputs()
         self._determine_batch_size()
+        if self.session_id is not None and self.session_params is not None:
+            raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -690,6 +701,7 @@ class GenerateReqInput:
             return cache[i]
         sub = GenerateReqInput(
             rid=self.rid[i],
+            session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -797,6 +809,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
+    session_id: Optional[str] = None
     session_params: Optional[SessionParams] = None
 
     # LoRA related
@@ -871,6 +884,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
+    # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
     batch: List[TokenizedGenerateReqInput]
 
     def __len__(self):
@@ -1156,6 +1170,7 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
 
 class BatchTokenizedEmbeddingReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized embedding requests
+    # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
     batch: List[TokenizedEmbeddingReqInput]
 
     def __len__(self):
@@ -1702,6 +1717,7 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
 
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
+    allow_quant_error: bool = False
 
 
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
@@ -1962,102 +1978,6 @@ class BlockReqType(Enum):
 
 class BlockReqInput(BaseReq, kw_only=True):
     req_type: BlockReqType
-
-
-class MemoryMetrics(msgspec.Struct, array_like=True):
-    """Memory breakdown metrics."""
-
-    weight_gb: float
-    kv_cache_gb: float
-    graph_gb: float
-    token_capacity: int
-
-
-class SpeculativeMetrics(msgspec.Struct, array_like=True):
-    """Speculative decoding metrics."""
-
-    accept_length: float
-    accept_rate: float
-
-
-class LoRAMetrics(msgspec.Struct, array_like=True):
-    """LoRA adapter pool metrics."""
-
-    slots_used: int
-    slots_total: int
-    utilization: float
-
-
-class DisaggregationMetrics(msgspec.Struct, array_like=True):
-    """PD disaggregation metrics."""
-
-    mode: str  # "prefill", "decode", or "null"
-    prefill_bootstrap_queue_reqs: int = 0
-    prefill_inflight_queue_reqs: int = 0
-    decode_prealloc_queue_reqs: int = 0
-    decode_transfer_queue_reqs: int = 0
-    decode_retracted_queue_reqs: int = 0
-    kv_transfer_speed_gb_s: float = 0.0
-    kv_transfer_latency_ms: float = 0.0
-
-
-class QueueMetrics(msgspec.Struct, array_like=True):
-    """Detailed queue info breakdown."""
-
-    waiting: int
-    grammar: int
-    paused: int
-    retracted: int
-
-
-class GetLoadsReqInput(BaseReq, kw_only=True):
-    """Request for /v1/loads endpoint."""
-
-    VALID_SECTIONS = frozenset(
-        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
-    )
-
-    include: List[str] = msgspec.field(default_factory=lambda: ["all"])
-    dp_rank: Optional[int] = None
-
-    def __post_init__(self):
-        """Validate include sections."""
-        if self.include:
-            invalid = set(self.include) - self.VALID_SECTIONS
-            if invalid:
-                raise ValueError(
-                    f"Invalid include sections: {invalid}. "
-                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
-                )
-
-
-class GetLoadsReqOutput(BaseReq, kw_only=True):
-    """Per-DP-rank load metrics for /v1/loads endpoint."""
-
-    dp_rank: int
-    timestamp: float
-
-    num_running_reqs: int
-    num_waiting_reqs: int
-    num_waiting_uncached_tokens: int
-    num_used_tokens: int
-    # num_used_tokens plus pending tokens not already allocated in the KV pool.
-    # Used for DP balance.
-    num_total_tokens: int
-    max_total_num_tokens: int
-    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
-    # not just KV token usage. Rename requires API deprecation.
-    token_usage: float
-    gen_throughput: float
-    cache_hit_rate: float
-    utilization: float
-    max_running_requests: int
-
-    memory: Optional[MemoryMetrics] = None
-    speculative: Optional[SpeculativeMetrics] = None
-    lora: Optional[LoRAMetrics] = None
-    disaggregation: Optional[DisaggregationMetrics] = None
-    queues: Optional[QueueMetrics] = None
 
 
 class SetInjectDumpMetadataReqInput(BaseReq, kw_only=True):
