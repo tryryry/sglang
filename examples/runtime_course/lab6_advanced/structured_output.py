@@ -53,7 +53,11 @@ def main(base_url: str):
     print()
 
     # Verify the constrained output is valid JSON that satisfies the schema keys.
-    parsed = json.loads(constrained)
+    try:
+        parsed = json.loads(constrained)
+    except json.JSONDecodeError as e:
+        print(f"FAILED: constrained output is not valid JSON: {e}")
+        return
     missing = [key for key in JSON_SCHEMA["required"] if key not in parsed]
     if missing:
         print(f"FAILED: missing required keys: {missing}")

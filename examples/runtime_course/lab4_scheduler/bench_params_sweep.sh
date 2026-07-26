@@ -25,7 +25,7 @@ CONFIGS=(
 )
 
 wait_for_server() {
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 60); do
         if curl -s "http://localhost:${PORT}/health" > /dev/null; then
             return 0
         fi
