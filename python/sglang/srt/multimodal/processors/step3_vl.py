@@ -834,6 +834,67 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
           2. process_and_combine_mm_data: 调用 self._processor（Step3VLProcessor）
                             做真正的预处理，打包成 mm_items，
                             并拼出展开后的 input_ids
+
+        ------------------------------------------------------------------
+        第 2 步展开：process_and_combine_mm_data 到底做了什么
+        （实现在 base_processor.py 的 BaseMultimodalProcessor 里，此处不重写）
+
+        以「一段文本 + 1 张 1512x1008 的图」为例，走一遍全过程：
+
+        (a) base_output.organize_results()
+            把 load_mm_data 的结果按模态归类。这里得到
+              raw_images = [PIL.Image(1512x1008)]，raw_audios/raw_videos 为空。
+            若全是纯文本（没有任何多模态数据），直接 tokenizer 编码后返回
+            ([], input_ids, {})，后面全部跳过。
+
+        (b) _process_and_collect_mm_items(...) -> process_mm_data(...)
+            这一步才真正调到 self._processor，也就是本文件的 Step3VLProcessor。
+            process_mm_data 负责把参数塞成 HF processor 的调用约定：
+              images -> kwargs["images"]，并把 self.image_config 合进 images_kwargs；
+              videos -> kwargs["videos"]；audios 按模型名走 "audio"/"audios"。
+            然后 `self._processor(text=..., images=..., return_tensors="pt")`，
+            落到 Step3VLProcessor.__call__：
+              - 切图：1 个 728x728 全局图 + N 个 504x504 局部 patch
+              - 把 prompt 里的 1 个 <im_patch> 占位符，展开成
+                局部 patch 段(每个 81 token) + 全局图段(169 token) + 换行
+              - 返回 BatchFeature{input_ids, attention_mask, pixel_values, ...}
+
+        (c) collect_mm_items_from_processor_output(ret)
+            遍历 BatchFeature 的每个字段，用 ATTR_NAME_TO_MODALITY 表反查它属于
+            哪个模态（pixel_values -> IMAGE，input_features -> AUDIO ...），
+            同模态的字段塞进同一个 MultimodalDataItem。
+            input_ids / format / hash / pad_value / offsets 是元数据，跳过不塞。
+            注意：此时**每个模态只有 1 个 item**（所有图的 pixel_values 拼在一起）。
+
+        (d) 回填 offsets
+            对每个 item，用 mm_tokens 查到该模态的占位 token id（这里是
+            IM_TOKEN_ID），在展开后的 input_ids 里扫描出所有连续区间：
+              get_mm_items_offset(input_ids, mm_token_id)
+            得到形如 [(12, 424)] 的 (start, end) 闭区间列表 —— 这些位置将来
+            要被替换成视觉 embedding。
+
+        (e) get_new_expanded_mm_items(all_collected_items)
+            把 (c) 里「一个模态一个 item」再**按图/按视频拆成一个个独立 item**。
+            目的是提升 radix cache 粒度：3 张图拆成 3 个 item 后，改动第 3 张
+            图不会让前 2 张的缓存失效。拆完再 set_pad_value() 算哈希占位值。
+
+        (f) 返回 (mm_items, input_ids, ret)
+            input_ids 就是展开后的完整序列（占位符已按实际 token 数铺开），
+            长度与最终喂给 LLM 的序列一致。
+
+        ------------------------------------------------------------------
+        几个容易踩的点：
+
+        - Step3VLProcessor 是 HF 风格的 processor（本文件里自己实现的），
+          而 Step3VLImageProcessor（本类）是 SGLang 的适配层。真正干活的是前者，
+          本类只负责「异步加载 + 调度 + 打包成 SGLang 的数据结构」。
+
+        - self.transform 那两个方法（preprocess/__call__）是死代码，
+          走的根本不是它们，别被误导。
+
+        - SGLANG_MM_AVOID_RETOKENIZE 那条分支只在「纯图 + 传入的是 token id 列表」
+          时生效，用于避免 decode->re-tokenize 造成的 token 漂移。
+          Step3 的常规文本输入不会走到。
         """
         base_output = await self.load_mm_data(
             prompt=input_text,
@@ -846,6 +907,8 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
+        # ret 是 Step3VLProcessor 的原始 BatchFeature 输出，此处不再需要
+        # （信息已经分别进了 mm_items 和 input_ids），故直接丢弃。
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
             mm_items=mm_items,
