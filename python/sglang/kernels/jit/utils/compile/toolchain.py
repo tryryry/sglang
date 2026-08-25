@@ -147,6 +147,19 @@ def base_include_paths() -> List[str]:
     return list(includes)
 
 
+def cuda_runtime_link_flags() -> List[str]:
+    """Link libcudart from either a toolkit or a CUDA wheel layout."""
+    root = pathlib.Path(cuda_home())
+    for lib_dir in (root / "lib64", root / "lib"):
+        unversioned = lib_dir / "libcudart.so"
+        if unversioned.is_file():
+            return [f"-L{lib_dir}", "-lcudart"]
+        versioned = sorted(lib_dir.glob("libcudart.so.*"))
+        if versioned:
+            return [str(versioned[-1])]
+    return [f"-L{root / 'lib64'}", "-lcudart"]
+
+
 def base_link_flags(*, with_device: bool) -> List[str]:
     """Link flags for a module, with the GPU runtime only when it has device code.
 
@@ -160,7 +173,7 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         return flags
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
-    return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+    return flags + cuda_runtime_link_flags()
 
 
 def compilers() -> Tuple[str, str]:

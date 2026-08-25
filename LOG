@@ -1,0 +1,56 @@
+PATH="$PWD/.venv/bin:$PWD/.venv/lib/python3.12/site-packages/nvidia/cu13/bin:$PATH" CUDA_HOME="$PWD/.venv/lib/python3.12/site-packages/nvidia/cu13" ./.venv/bin/sglang serve --model-path /root/models/Qwen3.5-2B --host 0.0.0.0 --port 30000 --attention-backend triton --sampling-backend pytorch --disable-prefill-cuda-graph --disable-decode-cuda-graph
+
+
+ChatCompletionRequest: messages=[ChatCompletionMessageUserParam(role='user', content=[ChatCompletionMessageContentImagePart(type='image_url', image_url=ChatCompletionMessageContentImageURL(url='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg==', detail='auto', max_dynamic_patch=None, min_dynamic_patch=None, content_hash=None), modalities='image'), ChatCompletionMessageContentTextPart(type='text', text='Describe the image.')])] model='/root/models/Qwen3.5-2B' frequency_penalty=0.0 logit_bias=None logprobs=False top_logprobs=None max_tokens=8 max_completion_tokens=None n=1 presence_penalty=0.0 response_format=None seed=None stop=None stream=False stream_options=None temperature=0.0 top_p=None user=None tools=None tool_choice='none' parallel_tool_calls=True return_hidden_states=Falsereturn_routed_experts=False routed_experts_start_len=0 return_cached_tokens_details=False return_spec_tokens_details=False return_prompt_token_ids=False return_token_ids=False return_meta_info=False return_sampling_mask=Falsereasoning_effort=None task=None top_k=None min_p=None min_tokens=0 regex=None ebnf=None repetition_penalty=None stop_token_ids=None stop_regex=None no_stop_trim=False ignore_eos=False continue_final_message=False skip_special_tokens=True lora_path=None session_id=None session_params=None separate_reasoning=True stream_reasoning=True chat_template_kwargs=None max_dynamic_patch=None min_dynamic_patch=None use_audio_in_video=False images_config=None video_config=None custom_logit_processor=None custom_params=None input_ids=None rid=None extra_key=None cache_salt=None priority=None bootstrap_host=None bootstrap_port=None bootstrap_room=None routed_dp_rank=None disagg_prefill_dp_rank=None data_parallel_rank=None
+Request: <sglang.srt.entrypoints.http_server.ORJSONRequest object at 0x7fd2c2735e50>
+
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/root/models/Qwen3.5-2B",
+    "messages": [
+      {"role": "user", "content": "你好，请用一句话介绍你自己。"}
+    ],
+    "max_tokens": 128,
+    "temperature": 0
+  }'
+
+
+curl -N http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/root/models/Qwen3.5-2B",
+    "messages": [
+      {"role": "user", "content": "你好，请用一句话介绍你自己。"}
+    ],
+    "max_tokens": 128,
+    "temperature": 0,
+    "stream": true
+  }'
+
+  raw_request
+├── headers
+├── URL / method / client
+├── connection state
+└── body ──解析校验──> ChatCompletionRequest
+
+ChatCompletionRequest: messages=[ChatCompletionMessageUserParam(role='user', content='你好，请用一句话介绍你自己。')] model='/root/models/Qwen3.5-2B' frequency_penalty=0.0 logit_bias=None logprobs=False top_logprobs=None max_tokens=128 max_completion_tokens=None n=1 presence_penalty=0.0 response_format=None seed=None stop=None stream=False stream_options=None temperature=0.0 top_p=None user=None tools=None tool_choice='none' parallel_tool_calls=True return_hidden_states=False return_routed_experts=False routed_experts_start_len=0 return_cached_tokens_details=False return_spec_tokens_details=False return_prompt_token_ids=False return_token_ids=False return_meta_info=False return_sampling_mask=False reasoning_effort=None task=None top_k=None min_p=None min_tokens=0 regex=None ebnf=None repetition_penalty=None stop_token_ids=None stop_regex=None no_stop_trim=False ignore_eos=False continue_final_message=False skip_special_tokens=True lora_path=None session_id=None session_params=None separate_reasoning=True stream_reasoning=True chat_template_kwargs=None max_dynamic_patch=None min_dynamic_patch=None use_audio_in_video=False images_config=None video_config=None custom_logit_processor=None custom_params=None input_ids=None rid=None extra_key=None cache_salt=None priority=None bootstrap_host=None bootstrap_port=None bootstrap_room=None routed_dp_rank=None disagg_prefill_dp_rank=None data_parallel_rank=None
+{
+    "model": "/root/models/Qwen3.5-2B",
+    "messages": [
+      {"role": "user", "content": "你好，请用一句话介绍你自己。"}
+    ],
+    "max_tokens": 128,
+    "temperature": 0
+  }
+
+ChatCompletionRequest 回答“模型应该怎样生成”；raw_request 回答“这次 HTTP 连接是谁、从哪里来、是否仍连接、携带哪些 headers”。两者并不重复。
+
+原始 body
+  + 类型校验
+  + 默认值
+  + 嵌套对象转换
+  = ChatCompletionRequest
+
+raw_request.body()：客户端实际发送了什么。
+ChatCompletionRequest：服务器理解并最终采用什么参数。

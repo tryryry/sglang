@@ -1723,6 +1723,8 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    print(f"ChatCompletionRequest: {request}")
+    print((await raw_request.body()).decode("utf-8"))
     return await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )
