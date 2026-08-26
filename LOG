@@ -54,3 +54,52 @@ ChatCompletionRequest 回答“模型应该怎样生成”；raw_request 回答�
 
 raw_request.body()：客户端实际发送了什么。
 ChatCompletionRequest：服务器理解并最终采用什么参数。
+
+
+/root/sglang/python/sglang/srt/entrypoints/openai/serving_chat.py
+
+serving_chat.py:1100：原始 messages
+serving_chat.py:1386：渲染 chat template
+serving_chat.py:1394：得到 prompt_ids
+serving_chat.py:966：构造内部请求
+tokenizer_manager.py:768：请求标准化
+tokenizer_manager.py:959：确认走 input_ids 直通分支
+tokenizer_manager.py:1334：生成最终 Tokenized 请求
+
+
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug SGLang Qwen3.5-2B",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "sglang.launch_server",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/python",
+        "CUDA_HOME": "${workspaceFolder}/.venv/lib/python3.12/site-packages/nvidia/cu13",
+        "PATH": "${workspaceFolder}/.venv/bin:${workspaceFolder}/.venv/lib/python3.12/site-packages/nvidia/cu13/bin:${env:PATH}"
+      },
+      "args": [
+        "--model-path",
+        "/root/models/Qwen3.5-2B",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "30000",
+        "--attention-backend",
+        "triton",
+        "--sampling-backend",
+        "pytorch",
+        "--disable-overlap-schedule",
+        "--disable-prefill-cuda-graph",
+        "--disable-decode-cuda-graph"
+      ]
+    }
+  ]
+}
