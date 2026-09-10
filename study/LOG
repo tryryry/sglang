@@ -103,3 +103,73 @@ tokenizer_manager.py:1334：生成最终 Tokenized 请求
     }
   ]
 }
+
+
+curl -s http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/root/models/Qwen3.5-2B",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+          }
+        },
+        {
+          "type": "text",
+          "text": "请描述这张图片。"
+        }
+      ]
+    }],
+    "max_tokens": 16,
+    "temperature": 0,
+    "return_meta_info": true
+  }' | jq '.choices[0].meta_info | {
+    prompt_tokens,
+    cached_tokens,
+    image_tokens
+  }'
+
+
+  curl -s http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/root/models/Qwen3.5-2B",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+            }
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"
+            }
+          },
+          {
+            "type": "text",
+            "text": "请分别描述这两张图片，并比较它们的异同。"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256,
+    "temperature": 0
+  }'
+
+TokenizerManager
+      │ ZMQ
+      ▼
+PP0-TP0 ──广播──> PP0-TP1
+      │
+      │ PP 点对点
+      ▼
+PP1-TP0 ──广播──> PP1-TP1
