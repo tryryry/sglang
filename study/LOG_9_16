@@ -1,0 +1,782 @@
+# get_next_batch_to_run 分析（2026-09-16）
+
+## 0. 位置
+
+| 版本 | 文件:行 | 说明 |
+|---|---|---|
+| 主实现 | `python/sglang/srt/managers/scheduler.py:3095` | 普通（colocate）模式，本文重点 |
+| PD 分离 - Prefill 侧 | `python/sglang/srt/disaggregation/prefill.py:546` `get_next_disagg_prefill_batch_to_run` | 只出 prefill batch |
+| PD 分离 - Decode 侧 | `python/sglang/srt/disaggregation/decode.py:2555` `get_next_disagg_decode_batch_to_run` | 只出 decode batch |
+| 多模态生成 | `python/sglang/multimodal_gen/runtime/managers/scheduler.py:982` | 另一套 runtime，无关 |
+
+签名：
+
+```python
+@scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+def get_next_batch_to_run(
+    self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+) -> NextBatchPlan          # schedule_batch.py:3464
+```
+
+`NextBatchPlan = msgspec.Struct(batch_to_run: Optional[ScheduleBatch], running_batch: ScheduleBatch)`。
+注意它是**纯函数式**返回：`running_batch` 也被返回出去，调用方必须回写 `self.running_batch`
+（历史上是直接改 `self.running_batch`，现在改成显式传入/传出，便于 PP 多 microbatch 各自持有一份）。
+
+## 1. 它在事件循环中的位置
+
+`scheduler.py:1778`（`event_loop_normal`）和 `scheduler.py:1822`（`event_loop_overlap`）：
+
+```
+while True:
+    recv_reqs = self.request_receiver.recv_requests()   # 收请求 → waiting_queue
+    self.process_input_requests(recv_reqs)
+
+    plan = self.get_next_batch_to_run(                  # ★ 本文主角：选出这一步要跑什么
+        running_batch=self.running_batch, last_batch=self.last_batch
+    )
+    self.running_batch = plan.running_batch
+    batch = plan.batch_to_run
+
+    if batch:
+        result = self.run_batch(batch)                  # 前向
+        self.process_batch_result(batch, result)        # 采样结果 / 出 token
+    else:
+        self.on_idle()
+
+    self.last_batch = batch                             # ★ 本轮 batch 变成下一轮的 last_batch
+```
+
+三个状态变量必须分清楚：
+
+- `waiting_queue`：还没跑过 prefill 的新请求（List[Req]）。
+- `running_batch`：**稳态的 decode 批**。
+- `last_batch`：**上一轮真正跑过的那个 batch**。如果上一轮是 extend(prefill)，这些 req 刚拿到第一个 output token，
+  需要在这一轮被"毕业"进 `running_batch` 去做 decode —— 这就是函数开头一大段 merge 逻辑的全部动机。
+
+为什么不在 prefill 结束时立刻 merge？因为 overlap 模式下 prefill 的结果要到下一轮才落地，
+必须等一轮再判断哪些 req 真的完成了（finished / 还在 chunk 中），所以 merge 被推迟到下一次调度开头。
+
+## 2. 主干逐段拆解（scheduler.py:3094-3233）
+
+整体可分 4 段：**清理 → 合批(last_batch → running_batch) → 选 prefill → 退化到 decode**。
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ ① 前置清理 (3098-3105)                                    │
+│   process_pending_chunked_abort()  延迟到安全点再 abort    │
+│   _abort_on_waiting_timeout()      排队超时踢掉            │
+│   _abort_on_running_timeout()      运行超时打 to_finish    │
+└──────────────────────────────────────────────────────────┘
+                          ↓
+┌──────────────────────────────────────────────────────────┐
+│ ② last_batch(extend) 合入 running_batch (3107-3182)       │
+│   chunked_req_to_exclude = {还没 prefill 完的 req}         │
+│   last_batch.filter_batch(exclude)   踢掉 finished/chunk   │
+│   running_batch.merge_batch(last_batch)                   │
+└──────────────────────────────────────────────────────────┘
+                          ↓
+┌──────────────────────────────────────────────────────────┐
+│ ③ 尝试组一个新的 prefill batch (3184-3191)                │
+│   new_batch = get_new_batch_prefill(running_batch)        │
+└──────────────────────────────────────────────────────────┘
+                          ↓
+┌──────────────────────────────────────────────────────────┐
+│ ④ 二选一 (3206-3215)                                      │
+│   new_batch 非空 → 跑 prefill（优先！）                    │
+│   否则          → update_running_batch() 跑 decode         │
+│   都没有        → ret = None（空转，on_idle）              │
+└──────────────────────────────────────────────────────────┘
+                          ↓ 尾处理：DP-attn sync / ngram / 打时间戳
+                      return NextBatchPlan(ret, running_batch)
+```
+
+### ① 前置清理（3098-3105）
+
+- `process_pending_chunked_abort()`（`scheduler.py:3008`）：
+  `abort_request` 对正在 chunked prefill 的请求**不能就地拆**（KV / metadata buffer 还在飞），
+  只记到 `_pending_chunked_abort_req`。这里是调度步的最开头，是唯一安全的清理点：
+  清掉 `self.chunked_req` 就能阻止下一个 chunk 发出，已经发出的那一个由 batch result 处理器 drain。
+- `_abort_on_waiting_timeout()`（`scheduler.py:2896`）：`SGLANG_REQ_WAITING_TIMEOUT` > 0 时，
+  扫 `waiting_queue`，超时的直接回 503 并从队列移除。
+- `_abort_on_running_timeout(running_batch)`（`scheduler.py:1672`）：`SGLANG_REQ_RUNNING_TIMEOUT`，
+  只打 `req.to_finish = FINISH_ABORT(...)`，不立刻拆——后面的 `filter_batch()` 会统一收割。
+  注释写明必须在 batch launch 之前调用。
+
+### ② last_batch → running_batch 的合并（3107-3182）
+
+核心三行：
+
+```python
+last_bs = last_batch.batch_size()
+last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))   # 3162
+if last_batch.batch_size() < last_bs:
+    running_batch.batch_is_full = False                                        # 3164 ★
+...
+running_batch.merge_batch(last_batch)                                          # 3172
+```
+
+几个要点：
+
+1. **只在 `last_batch.forward_mode.is_extend()` 时进这个分支**（3147-3151）。
+   上一轮如果是 decode，`running_batch` 本来就是它自己，不需要合。
+2. `chunked_req_to_exclude` 收集"还不能进 decode 的请求"：
+   - `self.chunked_req`：当前正在 chunked prefill、还没喂完的那个 req（3121-3124）。
+     同时调 `stash_chunked_request()` 把这一 chunk 的 KV 写进 radix tree 缓存，
+     但有个条件 `extend_range.end > len(prefix_indices)`——被 park 的 chunk 没产生新 KV，stash 是空操作。
+   - `last_batch.chunked_req`：PP（pipeline parallel）下 microbatch 各自持有的、已经过期的 chunked_req（3152-3155）。
+   - dLLM 的 staging 请求（3110-3119、3157-3158）。
+3. `batch_is_full = False`（3164）：**这是防饿死/防挂死的关键**。
+   `batch_is_full` 是 prefill adder 设置的"别再塞新请求了"的刹车；
+   一旦有 req 离开批，必须解除刹车，否则高并发下会永远不再接新请求。
+   同样的补偿在 `update_running_batch`（3653）、hisparse 分支（3145）、
+   以及 disagg prefill 的 HACK（`prefill.py:552`，注释直说"otherwise it hangs under high concurrency"）里都有。
+4. `is_prefill_only` 批（embedding / reward 这类不走 decode 的）单独处理（3179-3182）：
+   它们不会进 decode，所以 finished req 永远没人收，必须在这里 `filter_batch()`，
+   否则 `/v1/loads` 报的 `num_running_reqs` 会一直虚高。注释特别说明这段**放在 last_batch 块外面**，
+   为的是流量停了之后也能清干净。
+
+### ③ 组 prefill 批（3184-3191）
+
+```python
+if self.dllm_config is not None:
+    new_batch = self.get_new_batch_dllm(running_batch)
+elif self._should_defer_prefill():          # scheduler.py:1216
+    new_batch = None
+else:
+    prefill_plan = self.get_new_batch_prefill(running_batch)
+    new_batch = prefill_plan.batch_to_run
+    running_batch = prefill_plan.running_batch
+```
+
+`_should_defer_prefill()` / `_arm_prefill_decode_interval()`（`scheduler.py:1216/1223`）
+实现 `--prefill-decode-interval`：跑了一次 prefill 后，强制接下来 N 步只做 decode，
+避免长 prefill 把 decode 的 ITL（inter-token latency）打爆。
+`_arm` 里还特意区分了 DP-attn 场景用 `batch.is_extend_in_batch`（全局视角）而不是本地 `forward_mode`，
+保证各 rank 的 prefill/decode 节奏一致。
+
+`get_new_batch_prefill` → `_get_new_batch_prefill_raw`（`scheduler.py:3267`）是真正的准入逻辑，要点：
+
+- 快速返回条件（3286-3288）：`batch_is_full` 或 `waiting_queue` 空，且没有 chunked_req → 直接 `None`。
+- `get_num_allocatable_reqs()`（3237）= `pp_max_micro_batch_size - running_bs`，再与 req slot 余量取 min。
+  `<= 0` 就置 `batch_is_full = True` 返回；但 **chunked_req 无条件放行**（3300-3310 注释），
+  因为 PP 下 chunk 可能跨 microbatch，卡住就是内存泄漏。
+- `self.policy.calc_priority()` 对 waiting_queue 排序（LPM / FCFS / priority 等）。
+- 核心是 `PrefillAdder`：按 `max_prefill_tokens` / `chunked_prefill_size` / `max_prefill_bs` /
+  `new_token_ratio`（为未来 decode 预留 KV）逐个 `add_one_req`，返回 `AddReqResult`，
+  非 `CONTINUE` 就 break 并按情况置 `batch_is_full`。
+- 结尾 `mix_with_running`（3538-3552）：`--enable-mixed-chunk` 时把 decode 请求拼进这个 extend batch
+  一起跑（return_logprob / input_embeds 时禁用），此时 `running_batch` 被清空，decoding_reqs 挂到新批上。
+
+### ④ prefill 优先 + 退化到 decode（3206-3215）
+
+```python
+if new_batch is not None:
+    ret = new_batch                      # ★ 有 prefill 就先跑 prefill
+else:
+    if not running_batch.is_empty() and not running_batch.is_prefill_only:
+        running_batch = self.update_running_batch(running_batch)
+        ret = running_batch if not running_batch.is_empty() else None
+    else:
+        ret = None
+```
+
+**SGLang 的调度基调就是这一句：prefill 优先，没有 prefill 才 decode。**
+吞吐友好，但对 ITL 不友好，所以才有 `--prefill-decode-interval`、`prefill_delayer`、
+`min_free_slots_delayer` 这些反向的节流阀。
+
+`update_running_batch`（`scheduler.py:3581`）做三件事：
+1. `filter_batch()` 收割 finished；
+2. `check_decode_mem()` 不过 → `retract_decode()` **抢占回退**：把部分请求踢回 `waiting_queue`
+   （`_add_request_to_queue(req, is_retracted=True)`），腾 KV，同时上调 `new_token_ratio`（更保守地预留），
+   打 warning 日志 `KV cache pool is full. Retract requests.`；没触发则 `new_token_ratio_tracker.decay_step()` 慢慢放开；
+3. `prepare_for_decode()` 准备张量。
+   注意它也会在 batch 缩小时清 `batch_is_full`（3653）。
+
+### 尾处理（3217-3231）
+
+- `maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)`（`scheduler_components/dp_attn.py:425`）：
+  DP attention 下各 DP rank 必须在同一步进同一种 forward mode，本地没活也要造一个 `idle_batch` 参与集合通信。
+  3193-3204 的那段是为 **spec decoding + dp-attn** 打的补丁：提前对 `new_batch` 做一次 sync，
+  并用 `need_mlp_sync = new_batch is None` 避免重复 sync，确保 prefill 批和 decode 批不会被混进同一次同步。
+- `_arm_prefill_decode_interval(ret)`：如果这次真的出了 extend 批，重置 defer 计数器。
+- `ngram_embedding_manager.prepare_for_forward(...)`、`set_schedule_time_batch(ret)`、FPM 打点。
+
+## 3. 三个变体的对比
+
+| | 普通 | disagg PREFILL | disagg DECODE |
+|---|---|---|---|
+| 入口 | `scheduler.py:3095` | `prefill.py:546` | `decode.py:2555` |
+| last_batch merge | 有（extend→running） | 用 `process_prefill_chunk()` 代替 | 用 `get_new_prebuilt_batch()` 代替 |
+| prefill | `get_new_batch_prefill` | 同上 | 无 |
+| decode | `update_running_batch` | 无 | `update_running_batch` |
+| batch_is_full | 靠各处补偿 | 每轮开头无条件 `= False`（HACK 注释：否则高并发挂死） | 靠 `update_running_batch` |
+
+可以看出主实现 = 两个变体的并集，PD 分离只是把 prefill/decode 两半拆到不同进程。
+
+## 4. 读这段代码要抓住的点
+
+1. **返回 `NextBatchPlan` 而不是改 self**：`running_batch` 是入参也是出参，调用方负责回写；
+   PP 下多 microbatch 各持一份，这个签名是必须的。
+2. **`last_batch` 的唯一作用**是把上一轮 prefill 出来的请求"毕业"成 decode 请求，
+   而且这个 merge 必须推迟一轮（overlap 下结果还没落地）。
+3. **`batch_is_full` 是一个必须手动复位的刹车**，凡是"批变小了"的地方都要清它，
+   这是本函数里出现频率最高的一类 bug（现在代码里至少有 4 处补偿 + 1 处 HACK 注释）。
+4. **prefill 优先是硬编码的策略**，所有延迟控制都是在 ③ 之前用 delayer/interval 提前 return `None` 实现的，
+   而不是在 ④ 改优先级。
+5. **KV 不足的兜底是 retract 而不是 OOM**：`update_running_batch` 会把请求踢回队列重跑，
+   所以线上看到 `Retract requests` 日志 = KV 池打满，应该关注 `--mem-fraction-static` / 并发。
+6. 函数里大量 `if self.enable_xxx` 分支（hisparse / dllm / lora / hicache / spec / dp-attn / ngram）
+   是特性叠加的结果，读主干时可以先把它们全部当作 False 跳过。
+
+---
+
+# 附录：逐点追问记录
+
+## A1. `last_batch.forward_mode.is_extend()` 代表什么（scheduler.py:3150）
+
+`forward_mode` 是 batch 的**前向类型标签**，`is_extend()` 在问："上一轮跑的那个 batch，是不是一个做 prefill（算 KV）的批？"
+
+### 定义：`forward_batch_info.py:104` 的 `ForwardMode(IntEnum)`
+
+| 枚举值 | 含义 | `is_extend()` |
+|---|---|---|
+| `EXTEND` | 标准 prefill：算一段新 token 的 KV | ✅ |
+| `MIXED` | mixed chunked prefill：extend 批里拼了 decode 请求 | ✅ |
+| `TARGET_VERIFY` | 投机解码里 target model 一次验多个 token | ✅ |
+| `SPLIT_PREFILL` | PD 复用下切分的 prefill | ✅ |
+| `DLLM_EXTEND` | dLLM 的 extend | ✅ |
+| `DECODE` | 每步出一个 token | ❌ |
+| `IDLE` | 本 rank 没活，为 DP attention 凑数参与集合通信 | ❌ |
+| `PREBUILT` | PD 分离 decode 侧，KV 已由 prefill 节点传来 | ❌ |
+| `DRAFT_EXTEND_V2` | 投机解码 draft model 的 extend | 默认 ❌，`include_draft_extend_v2=True` 时 ✅ |
+
+```python
+def is_extend(self, include_draft_extend_v2: bool = False):
+    return (
+        self == ForwardMode.EXTEND
+        or self == ForwardMode.MIXED
+        or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
+        or self == ForwardMode.TARGET_VERIFY
+        or self == ForwardMode.SPLIT_PREFILL
+        or self == ForwardMode.DLLM_EXTEND
+    )
+```
+
+`is_prefill()` 就是 `is_extend()` 的别名。SGLang 叫 extend 而不是 prefill，是因为前缀 KV 可能已在 radix cache 命中，实际只"延长"未命中的那段。
+
+### 谁给它赋值（都在 `schedule_batch.py`）
+
+| 方法 | 行 | 赋值 |
+|---|---|---|
+| `prepare_for_extend()` | 2408 | `EXTEND` |
+| `prepare_for_split_prefill()` | 2791 | `SPLIT_PREFILL` |
+| `mix_with_running()` | 2794 | `MIXED` |
+| `prepare_for_idle()` | 2987 | `IDLE` |
+| `prepare_for_decode()` | 3096 | `DECODE` |
+
+### 在 3147 这里的作用
+
+```python
+if (not self.enable_hisparse and last_batch and last_batch.forward_mode.is_extend()):
+    # ... filter + merge 进 running_batch
+```
+
+这是"毕业"判断的门卫：
+
+- **上一轮是 extend** → 这批请求刚算完 KV、刚吐出第一个 token，该转成 decode 请求了 → filter + merge。
+- **上一轮是 decode** → `last_batch` 本来就**是** `running_batch`（同一个对象），见 A2。
+- **上一轮是 IDLE** → 空批，没请求可合。
+- **`last_batch is None`** → 服务刚启动或上一轮空转（`on_idle`）。
+
+等价语义："上一轮有没有产生一批需要转入 decode 稳态的新请求"。`MIXED` 也返回 True 是对的——mixed chunk 批里那部分 extend 请求同样需要毕业。
+
+## A2. 为什么"decode 时 last_batch 就是 running_batch"
+
+关键在**对象身份（identity）**：decode 步里 `batch_to_run` 和 `running_batch` 是**同一个 Python 对象**，prefill 步里是两个不同对象。
+
+### Prefill 那一步
+
+`_get_new_batch_prefill_raw:3487` 是 `new_batch = ScheduleBatch.init_new(can_run_list, ...)`——**新建**对象。
+
+```python
+ret = new_batch                                                       # 3208
+return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)   # 3233
+```
+
+`batch_to_run`（新批 {A,B}）和 `running_batch`（老 decode 批 {C,D}）是**两个不同对象**。回到事件循环：
+
+```python
+self.running_batch = plan.running_batch      # → 老批 {C,D}
+batch = plan.batch_to_run                    # → 新批 {A,B}
+self.last_batch = batch                      # → 新批 {A,B}
+```
+
+下一轮进函数：`running_batch={C,D}`，`last_batch={A,B}`，不同对象 → merge 有意义 → `{C,D,A,B}`。
+
+### Decode 那一步
+
+`update_running_batch:3581` 是**原地改**入参然后原样返回：
+
+```python
+def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+    batch.filter_batch()
+    ...
+    batch.prepare_for_decode()
+    return batch          # ← 返回的就是入参那个对象
+```
+
+```python
+running_batch = self.update_running_batch(running_batch)   # 3212，对象没变
+ret = running_batch                                        # 3213
+return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)   # 两字段同一对象
+```
+
+回到事件循环，三个名字全指向同一个对象：
+
+```python
+self.running_batch = plan.running_batch    # ┐
+batch = plan.batch_to_run                  # ├─ 同一个对象
+self.last_batch = batch                    # ┘
+```
+
+**`self.last_batch is self.running_batch` → True**。
+
+### 没有门卫会怎样
+
+`merge_batch:3268` 的合并写法（`schedule_batch.py:3322`）：
+
+```python
+self.reqs = self.reqs + other.reqs
+self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+self.req_pool_indices = torch.cat([...])
+```
+
+`other is self` 时 `[C,D] + [C,D] = [C,D,C,D]`——每个请求复制一份。batch size 每步翻倍，`req_pool_indices` 同一 slot 出现两次，KV 写入冲突、采样重复出 token，一步就炸。
+
+```
+prefill 轮:  running={C,D}  last={A,B}   不同对象 → merge 有意义 → {C,D,A,B}
+decode  轮:  running={C,D}  last={C,D}   同一对象 → merge 是灾难 → {C,D,C,D}
+                            ^^^^^^^^^^
+                            is_extend() == False，门卫挡住
+```
+
+用 `forward_mode` 而不是 `last_batch is not running_batch` 判断，是因为 PP / overlap 下还有 IDLE 批、`batch.copy()` 等情况，语义判断比 identity 判断更稳。
+
+顺带：overlap 模式下 `self.result_queue.append((batch.copy(), batch_result))`（1850）压进队列的是 **copy**，但 `self.last_batch = batch`（1869）存的仍是原对象，所以上面的推理在 overlap 下同样成立。
+
+## A3. `chunked_req_to_exclude` 指的是什么
+
+一张**"这一轮不许毕业进 decode 的请求"黑名单**，唯一用途是喂给 `last_batch.filter_batch()`。
+
+```python
+chunked_req_to_exclude = set()                                                 # 3108
+# ... 三处往里加 ...
+last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))   # 3162
+```
+
+`filter_batch`（`schedule_batch.py:3182`）核心就一句：
+
+```python
+keep_indices = [
+    i for i in range(len(self.reqs))
+    if not self.reqs[i].finished()                       # 条件一：没跑完的留下
+    and self.reqs[i] not in chunked_req_to_exclude       # 条件二：不在黑名单的留下
+]
+```
+
+一次性踢掉两类：**已完成的**（自然淘汰）和**黑名单里的**（人为拦下）。
+
+### 为什么需要它：chunked prefill
+
+10 万 token 的长 prompt 受 `--chunked-prefill-size` 限制，要切块分多轮算：
+
+```
+轮 1: 算 token [0, 8192)        ← 只写 KV，没有 output token
+轮 2: 算 token [8192, 16384)    ← 只写 KV，没有 output token
+...
+轮 N: 算 token [98304, 100000)  ← 最后一块，这才出第一个 output token
+```
+
+`self.chunked_req` = "当前正在被分块喂、还没喂完"的请求。是否还存在由 `add_chunked_req` 返回值决定
+（`schedule_policy.py:1053`）：`return req if truncated else None`。
+
+问题：轮 1 跑完后这个请求**出现在 `last_batch.reqs` 里**（它确实参与了前向），且 `finished()` 是 False。
+按默认规则会被保留、被 merge 进 `running_batch`——但它还没算完 prefill，**没有 output token 可 decode**，
+放进 decode 批直接状态错乱。`finished()` 判断不了它，所以需要额外黑名单。
+
+### 名单里的三类
+
+```python
+# ① dLLM 的 staging 请求（3110-3119）
+if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
+    chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
+
+# ② 当前正在分块喂的请求（3121-3132）
+if self.chunked_req is not None:
+    chunked_req_to_exclude.add(self.chunked_req)
+    if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+        self.stash_chunked_request(self.chunked_req)     # 顺手把这块 KV 存进 radix cache
+
+# ③ PP 下 microbatch 自带的、已过期的 chunked_req（3152-3155）
+if last_batch.chunked_req is not None:
+    chunked_req_to_exclude.add(last_batch.chunked_req)
+```
+
+② 和 ③ 的区别：
+
+- `self.chunked_req` = **scheduler 全局**的"我现在正在分块处理谁"。
+- `last_batch.chunked_req` = **那个 batch 创建时**拍下的快照（`ScheduleBatch.init_new(..., chunked_req=self.chunked_req)`，3498）。
+
+单机非 PP 时两者一致，加进 set 只是去重。PP 下多 microbatch 错开飞行：某 microbatch 手里的 `chunked_req`
+可能已在别的 microbatch 喂完（`self.chunked_req` 已置 None），这个快照就是**过期的**。
+注释 "the current microbatch still track outdated chunked_req, we need to discard it" 说的就是它——
+过期的也得拦，否则会被当成正常请求 merge 进去。用 `set` 正是因为三个来源会重叠。
+
+### 容易混的点：拦下 ≠ 丢弃
+
+被拦的请求仍由 `self.chunked_req` / `waiting_queue` 持有，下一轮继续喂下一块：
+
+```python
+if self.chunked_req is not None:
+    self.chunked_req.init_next_round_input()
+    self.chunked_req = adder.add_chunked_req(self.chunked_req)   # 3360-3361
+```
+
+而且 `add_chunked_req` **无条件放行**（不受 `batch_is_full` / `num_allocatable_reqs` 限制，见 3302-3310 注释），
+因为半截的 chunked prefill 一旦卡住就是 KV 内存泄漏。
+
+```
+轮 k:   last_batch = {A(chunk中), B(prefill完), C(已finish)}
+        ↓ filter_batch(exclude={A})
+        ├─ A → 黑名单拦下，留在 self.chunked_req，下轮继续喂
+        ├─ C → finished()，淘汰
+        └─ B → 保留，merge 进 running_batch 开始 decode
+```
+
+## A4. `running_batch.filter_batch()` 作用是什么、为什么需要
+
+`filter_batch()` 是 **batch 的收割器**：把已跑完的请求摘出去，并保证 batch 内部十几个并行数组重新对齐。
+
+### 前提：ScheduleBatch 是"并行数组的结构体"
+
+batch 不是简单的请求列表，而是一堆**按位置对齐**的数组：
+
+```
+索引                  0        1        2        3
+reqs                [A,       B,       C,       D]
+req_pool_indices    [17,      3,       42,      8]      ← GPU 上的 req slot 号
+seq_lens            [128,     512,     64,      900]
+input_ids           [t_A,     t_B,     t_C,     t_D]
+top_logprobs_nums   [0,       5,       0,       0]
+sampling_info.temperatures  [...]                        ← 同样按位置
+spec_info                   [...]
+```
+
+GPU kernel 全靠**位置**索引。摘掉 C 不能只 `reqs.remove(C)`——必须同时删掉所有数组的第 2 个位置，
+否则 `reqs[2]` 是 D 而 `seq_lens[2]` 还是 C 的 64，整批错位。
+
+### 它做的事（`schedule_batch.py:3182`）
+
+```python
+keep_indices = [i for i in range(len(self.reqs))
+                if not self.reqs[i].finished()
+                and self.reqs[i] not in chunked_req_to_exclude]
+# 用 keep_indices 重建所有并行结构
+self.reqs = [self.reqs[i] for i in keep_indices]
+self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+self.seq_lens = self.seq_lens[keep_indices_device]
+self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+self.input_ids = self.input_ids[keep_indices_device]
+...
+self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+self.spec_info.filter_batch(...)
+```
+
+顺带三件事：
+
+- **作废派生值**：`out_cache_loc = None`、`seq_lens_sum = None`、一堆 `mamba_* = None`
+  （下次 `ForwardBatch.init_new` 重算）。
+- **重算聚合标志**：`return_logprob = any(...)`、`has_grammar = any(...)`、`return_hidden_states_mode`
+  ——批里最后一个要 logprob 的请求走了，整批就不用再算 logprob。
+- **两条快速路径**：全删 → `reqs = []` 直接返回（残留张量不清，`is_empty()` 只看 `reqs`，调用方会丢弃该批）；
+  一个没删 → 直接返回，零开销。
+
+### 为什么必须做：不做会写到已释放的 slot
+
+`req.finished()` 就是 `finished_reason is not None`（`schedule_batch.py:1276`），由上一轮 batch result
+processor 打上。**关键是同一处已经把 KV 还回去了**（`batch_result_processor.py:327`）：
+
+```python
+req.update_finish_state()
+if req.finished():
+    release_kv_cache(req, self.tree_cache)     # ← KV / req slot 已经释放
+```
+
+所以进入下一轮调度时，C 在 batch 数组里还占着位置，但 `req_pool_indices[2] = 42` 这个 slot
+**已经还给分配器、随时可能分给新请求**。不 filter 就跑下一次 decode 会：
+
+- 白算一个死请求的 attention；
+- 往 slot 42 写 KV —— 而 42 可能已属于别人，**直接踩内存**；
+- 采样还给它出 token，然后试图发给已关闭的连接。
+
+所以 `filter_batch` 不是优化，是正确性要求。
+
+### scheduler.py 里的四个调用点
+
+| 行 | 位置 | 场景 |
+|---|---|---|
+| 3162 | `last_batch.filter_batch(chunked_req_to_exclude=...)` | prefill 批毕业前，踢掉 finished + 黑名单（见 A3） |
+| 3180 | `running_batch.filter_batch()` | **prefill-only 批的专用清理** |
+| 3540 | `running_batch.filter_batch()` | mixed chunk：decode 请求拼进 extend 批之前先清一遍 |
+| 3585 | `batch.filter_batch()` in `update_running_batch` | **decode 主路径的常规收割**（每个 decode 步开头） |
+
+### 3179-3182 这个为什么单独存在
+
+```python
+if running_batch.is_prefill_only:
+    running_batch.filter_batch()
+    if running_batch.is_empty():
+        running_batch.batch_is_full = False
+```
+
+`is_prefill_only` 指 `max_new_tokens == 0` 的请求（`schedule_batch.py:1225`）——embedding、reward model、
+classify 这类只要 hidden states 不要生成的。它们**永远不进 decode**，第 ④ 步明确跳过：
+
+```python
+if not running_batch.is_empty() and not running_batch.is_prefill_only:   # 3211
+    running_batch = self.update_running_batch(running_batch)
+```
+
+于是常规收割点 `update_running_batch`（3585 那个 filter）对它们**永远不会被调用**。
+没有 3180 这行，跑完的 prefill-only 请求会永远赖在 `running_batch` 里，
+`/v1/loads` 报的 `num_running_reqs` 只增不减。
+
+注释还强调了摆放位置：
+
+> Runs outside the last_batch block so stale requests are cleaned even when no new batches arrive (e.g. traffic stops).
+
+放在 `if last_batch and last_batch.forward_mode.is_extend()` 块**外面**，是为了流量停了之后
+（`last_batch` 变 None、再没新批进来）这段仍会执行，把最后一批清干净，否则计数永久卡在非零值上。
+
+后面的 `batch_is_full = False` 是那个反复出现的刹车复位——批空了必须解除"别再接新请求"的标志。
+
+## A5. `# Run decode (skip for prefill-only batches)` —— 为什么 prefill-only 要跳过 decode
+
+```python
+if not running_batch.is_empty() and not running_batch.is_prefill_only:   # 3211
+    running_batch = self.update_running_batch(running_batch)
+```
+
+**因为 prefill-only 请求在 prefill 那一步就彻底完成了**——产出就是 extend 前向本身产生的 hidden states，
+没有 token 要生成。对它们跑 decode 不只是浪费，而是会踩已释放的内存。
+
+### 谁是 prefill-only
+
+```python
+@property
+def is_prefill_only(self) -> bool:                    # schedule_batch.py:1225
+    spec_alg = get_spec().speculative_algorithm
+    return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+```
+
+即 **`max_new_tokens == 0`** 的请求：embedding、reward model、classify/score、只要 input logprob 的请求。
+批级别标志全员同意才成立（`init_new` 里 `all(req.is_prefill_only for req in reqs)`，2257；
+`merge_batch` 里 `self.is_prefill_only and other.is_prefill_only`，3329）。
+
+### 它们在 prefill 那一步就 finished 了
+
+**① tp_worker 根本不采样**（`tp_worker.py:658`）：
+
+```python
+if not forward_batch.is_prefill_only:
+    batch_result.next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+else:
+    # For prefill-only requests, create dummy token IDs on CPU
+    batch_result.next_token_ids = torch.zeros(len(forward_batch.seq_lens), ...)
+```
+
+没有"下一个 token"这个概念，填 0 占位。embedding 模型甚至没有 lm_head，decode 对它们
+**在数学上就是未定义的**——走 pooler 出 embedding 而不是 logits。
+
+**② 结果处理时塞一个假 token**（`batch_result_processor.py:410`）：
+
+```python
+req.time_stats.set_prefill_finished_time()
+req.output_ids.append(0)          # Dummy output token for embedding models
+req.update_finish_state()
+```
+
+**③ `update_finish_state` 立刻判它结束**（`schedule_batch.py:1680`）：
+
+```python
+if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+    self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
+```
+
+`len(output_ids)` 是 1，`max_new_tokens` 是 0 —— `1 >= 0` 恒成立。
+**每个 prefill-only 请求在它的 prefill 结果被处理的那一瞬间就 finished**，
+紧接着 `release_kv_cache(req, self.tree_cache)`（413）把 KV 和 req slot 还了回去。
+
+所以对 prefill-only 的 `running_batch` 跑 decode，就是 A4 里那个踩内存场景：
+往已释放的 slot 写 KV，给已经返回给客户端的请求采样。
+
+### 那它们怎么会进 running_batch 的（overlap 时序）
+
+`event_loop_overlap` 里结果处理**排在 `get_next_batch_to_run` 之后**：
+
+```python
+plan = self.get_next_batch_to_run(...)     # ← 先调度
+batch = plan.batch_to_run
+if batch: run_batch(batch) → result_queue.append(...)
+if self.last_batch:
+    if not disable_overlap_for_batch: pop_and_process()   # ← 后处理上一批结果
+self.last_batch = batch
+```
+
+于是：
+
+```
+iter N:    prefill-only 批 P 发射。last_batch = P。结果还没落地。
+
+iter N+1:  get_next_batch_to_run 看到 last_batch=P、is_extend()=True
+           → 3162 filter_batch：P 的请求此刻 finished()=False（结果还没处理！）→ 一个没删
+           → 3172 merge 进 running_batch   ★ 就这样进来了
+           → 3179 running_batch.is_prefill_only=True → filter_batch() → 仍没 finished，删不掉
+           → 3211 跳过 decode
+           ... 本轮稍后 pop_and_process() 才把 P 的结果落地 → 全部 finished + KV 释放
+
+iter N+2:  3180 running_batch.filter_batch() → 这次才真正清干净
+```
+
+非 overlap 模式时序更简单：结果在 iter N 当场处理完，iter N+1 的 3162 那次 filter 就把它们全删了，
+`last_batch` 直接变空，压根不会 merge 进来。
+
+这解释了两件事：
+
+1. **为什么 3211 要跳过 decode** —— 3179 的清理在 N+1 轮"来不及"，`running_batch` 会短暂地装着
+   一批不该 decode 的请求。跳过是保证正确性的那道闸。
+2. **为什么 3179 的清理必须独立存在**（见 A4）—— 正因为 3211 跳过了 `update_running_batch`，
+   常规收割点永远不会被调用，只能在这里单独收。
+
+两行是配套的：**一个负责"不要跑"，一个负责"清出去"**。
+
+### 边界情况：混合批
+
+`running_batch` 里既有普通生成请求又有 embedding 请求时，`is_prefill_only` 是 `all(...)` 的结果 → False
+→ 正常走 decode。此时那些 prefill-only 请求已经 finished，会被 `update_running_batch` 开头的
+`filter_batch()`（3585）常规收割掉，不会参与前向。所以混合批不需要特殊处理。
+
+## A6. `batch_to_run` 和 `running_batch` 的区别
+
+一句话：**`batch_to_run` 是"这一步要喂给 GPU 的东西"，`running_batch` 是"跨步持有的 decode 状态"**。
+一个是瞬时的动作，一个是持久的状态。
+
+```python
+class NextBatchPlan(msgspec.Struct):        # schedule_batch.py:3464
+    batch_to_run: Optional[ScheduleBatch]   # 可以是 None
+    running_batch: ScheduleBatch            # 永远不是 None
+```
+
+类型签名已经说明了区别。
+
+### 角色对照
+
+| | `batch_to_run` | `running_batch` |
+|---|---|---|
+| 生命周期 | **一步**，用完即弃 | **跨步**，一直存在 |
+| 能否为 None | 能（空转时） | 不能 |
+| 初始值 | — | `ScheduleBatch(reqs=[], batch_is_full=False)`（`scheduler.py:1159`） |
+| 内容 | 这次 forward 要算的请求 | 处于 decode 稳态的所有请求 |
+| 谁消费 | `run_batch(batch)` → GPU | 下一轮的 `get_next_batch_to_run` |
+| 事件循环里存到哪 | `batch` 局部变量 → `self.last_batch` | `self.running_batch` |
+
+`running_batch` 空闲时是 `reqs=[]` 的空 batch 而不是 `None`——这样 `batch_is_full`、`is_empty()`
+这些调用不用到处判空。`last_batch` 则是真正的 `Optional`（1163）。
+
+### 四种情况下两者的关系
+
+**① Prefill 步 —— 两个不同对象**
+
+```python
+ret = new_batch      # 3208，ScheduleBatch.init_new 新建的
+return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+```
+
+```
+batch_to_run  → {A, B}      新 prefill 批，这一步喂给 GPU
+running_batch → {C, D}      老的 decode 稳态，这一步不动
+```
+
+A、B 要等下一轮通过 merge 并进 `running_batch`（A2 的毕业过程）。
+
+**② Decode 步 —— 同一个对象**
+
+```python
+running_batch = self.update_running_batch(running_batch)   # 原地改，返回自己
+ret = running_batch
+```
+
+```
+batch_to_run  ─┐
+               ├→ {C, D}    同一个 ScheduleBatch 对象
+running_batch ─┘
+```
+
+decode 稳态本身就是要跑的东西，没有第二个批。这是 A2 里门卫存在的根本原因。
+
+**③ 空转 —— 一个 None，一个空批**
+
+```
+batch_to_run  → None        没活干，走 on_idle()
+running_batch → {} 空批      对象还在，等着接下一批
+```
+
+**④ Mixed chunked prefill —— 最反直觉的一种**（`_get_new_batch_prefill_raw:3538-3547`）
+
+```python
+running_batch.filter_batch()
+if not running_batch.is_empty():
+    running_batch.prepare_for_decode()
+    new_batch.mix_with_running(running_batch)      # decode 请求拼进 extend 批
+    new_batch.decoding_reqs = running_batch.reqs
+running_batch = ScheduleBatch(reqs=[], batch_is_full=running_batch.batch_is_full)   # ★ 清空
+```
+
+```
+batch_to_run  → {A, B, C, D}   extend 请求 + decode 请求混在一个 forward 里
+running_batch → {}             被清空，因为 C、D 已经"借"给 batch_to_run 了
+```
+
+C、D 这一步的 decode 在 `batch_to_run` 里完成，`running_batch` 若还留着它们，下一轮会重复调度。
+注意清空用的是**重新构造一个 ScheduleBatch 并只继承 `batch_is_full`**，而不是原地 `reqs.clear()`
+——符合 `.claude/rules/schedule-batch-out-of-place-mutation.md`。
+
+### 为什么要作为两个字段返回出来
+
+历史上是直接改 `self.running_batch`。改成显式传入传出有两个原因：
+
+1. **PP 多 microbatch**：`collect_inflight_reqs`（`scheduler.py:4611`）里可见，PP 开启时根本不用
+   `self.running_batch` 而是 `self.running_mbs` —— 每个 microbatch 各持一份 decode 状态。
+   函数签名把 `running_batch` 收成参数，才能被多份状态复用。
+2. **可测试 / 无副作用**：不再隐式改 self，输入输出都在签名里。测试可直接构造
+   （`test/registered/unit/managers/test_batch_result_processor_mamba_boundary.py:123` mock 了这个签名）。
+
+调用方必须两个都接住，少接一个就丢状态：
+
+```python
+plan = self.get_next_batch_to_run(running_batch=self.running_batch, last_batch=self.last_batch)
+self.running_batch = plan.running_batch    # ← 必须回写，否则 mixed chunk 的清空、prefill 的 merge 全丢
+batch = plan.batch_to_run
+```
+
+### 和 `last_batch` 凑成三元组
+
+```
+self.running_batch  ── 持久的 decode 状态（跨步累积）
+self.last_batch     ── 上一步跑过的 batch（一步的记忆，用来做毕业判断）
+batch_to_run        ── 这一步要跑的 batch（局部变量，跑完赋给 last_batch）
+
+          batch_to_run ──(本轮末尾)──→ last_batch ──(下轮 merge)──→ running_batch
+```
+
+`self.last_batch = batch`（1795 / 1869）就是这条链的传送带。
