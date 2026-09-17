@@ -780,3 +780,322 @@ batch_to_run        ── 这一步要跑的 batch（局部变量，跑完赋�
 ```
 
 `self.last_batch = batch`（1795 / 1869）就是这条链的传送带。
+
+## A7. `_get_new_batch_prefill_raw` 详解（scheduler.py:3267-3551）
+
+prefill 准入的核心，职责单一：**从 `waiting_queue` 里挑出这一步能跑的请求，组装成一个 extend batch**。
+返回 `(Optional[ScheduleBatch], ScheduleBatch)`。外层 `get_new_batch_prefill`（3240）只负责
+`prefill_delayer` 的构造和事后 `finalize`，真正逻辑全在 raw 里。
+
+### 五个阶段
+
+```
+① 前置准备 + 四道快速拒绝闸        3272-3322   不满足条件就直接 return None
+② 构造 PrefillAdder（预算账本）    3324-3357   算出这一批的四类预算上限
+③ chunked_req 插队续上             3359-3361   半截的长请求优先，无条件放行
+④ 主循环：逐个 add_one_req         3376-3466   遍历 waiting_queue，装到装不下为止
+⑤ 收尾：出队 + 建批 + mixed chunk  3468-3551   真正创建 ScheduleBatch
+```
+
+### ① 四道快速拒绝闸（3272-3322）
+
+三件准备：
+
+```python
+if self.grammar_manager.has_waiting_grammars():            # 3273
+    for req in self.grammar_manager.get_ready_grammar_requests():
+        self._add_request_to_queue(req)
+```
+
+结构化输出（JSON schema / regex）的请求要先编译 FSM，编译期间扣在 grammar queue 里。这里把编译好的
+**回流到 `waiting_queue`**——所以一个请求可能等好几轮才第一次有资格参与调度。
+
+```python
+if self.enable_priority_preemption or self.is_hybrid_swa:  # 3281
+    running_batch.batch_is_full = False                    # 强制解除刹车
+```
+
+开优先级抢占时必须解除 `batch_is_full`，否则闸 1 直接返回，adder 根本没机会做抢占。
+
+四道闸，任何一道拦住就 `return None, running_batch`：
+
+| 闸 | 行 | 条件 | 副作用 |
+|---|---|---|---|
+| 1 | 3285 | `batch_is_full` 或 `waiting_queue` 空 | 无 |
+| 2 | 3292 | `min_free_slots_delayer` 要求留白 | 无 |
+| 3 | 3307 | `get_num_allocatable_reqs() <= 0` | **置 `batch_is_full = True`** |
+| 4 | 3318 | `TEST_RETRACT` 测试钩子 | 无 |
+
+**三道闸都给 `chunked_req` 开了后门**（`and self.chunked_req is None`）。3302-3306 注释：
+
+> we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+
+半截的 chunked prefill 已占着 KV 和 req slot，被容量检查卡住不继续喂，那部分内存**永远不会释放**
+——既不是运行中也不是完成，成了泄漏。所以 chunked_req 有绝对通行权。
+
+闸 3 与闸 1 的区别：闸 3 **主动置 `batch_is_full = True`**，等于告诉外层"已经满了，下次别白跑"，
+是个记忆化；闸 1 只是读这个标志。
+
+中间还有一行排序：
+
+```python
+self.policy.calc_priority(self.waiting_queue, running_batch)   # 3316
+```
+
+按调度策略（LPM 最长前缀匹配 / FCFS / priority / DFS-weight）**原地重排 `waiting_queue`**。
+后面主循环按这个顺序遍历，策略的全部影响就在这一行。
+
+### ② PrefillAdder：一本四栏的预算账本（3324-3357）
+
+`PrefillAdder`（`schedule_policy.py:511`）不是"加法器"，是**预算跟踪器**。四类互相独立的预算，
+任何一类见底就停止收人：
+
+| 预算 | 来源 | 约束什么 |
+|---|---|---|
+| `rem_total_tokens` | KV 池 available + tree_cache evictable | **显存**：这批请求从现在到跑完总共要多少 KV |
+| `cur_rem_tokens` | 同上 | **显存峰值**：只算这一次 extend 要写的 KV |
+| `rem_input_tokens` | `--max-prefill-tokens` | **算力**：一次 forward 最多算多少 token |
+| `rem_chunk_tokens` | `--chunked-prefill-size` | **切片**：单请求单次最多喂多少 token |
+
+前两者的区别在 `_update_prefill_budget`（`schedule_policy.py:864`）：
+
+```python
+self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
+self.cur_rem_token_offset  += extend_input_len +                   page_overhead + mamba_gap_reserve
+#                                               ^^^^^^^^^^^^^^^ 只有 total 扣未来 decode 的量
+```
+
+`rem_total_tokens` 额外扣 `max_new_tokens`——**为这个请求未来要生成的 token 预留 KV**。
+预留量还要乘 `new_token_ratio`（`_get_running_request_total_token_offset:660`）：
+
+```python
+min(max_new_tokens - len(output_ids), CLIP_MAX_NEW_TOKENS) * self.new_token_ratio
+```
+
+`new_token_ratio` 是**乐观系数**：大多数请求不会真跑满 `max_new_tokens`，按打折预留。
+由 `new_token_ratio_tracker` 动态调节——`update_running_batch` 里一旦 retract 就上调
+（变悲观、预留更多、少收人），平时每步 `decay_step()` 下调（变乐观、多收人）。
+这是一个**负反馈环**：踩坑了就收敛，太平了就放开。
+
+#### 三种返回值的语义差别
+
+```python
+def budget_state(self):                        # schedule_policy.py:841
+    no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
+    ...
+    if no_token:  return AddReqResult.NO_TOKEN
+    if self.rem_input_tokens <= 0:  return AddReqResult.OTHER
+    if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:  return AddReqResult.OTHER
+    return AddReqResult.CONTINUE
+```
+
+- **`NO_TOKEN`** = **显存**不够。主循环因此置 `batch_is_full = True`（3438-3445），
+  意思是"这轮以后都别再试了"。
+- **`OTHER`** = **算力/切片**预算用完。只 `break`，**不置** `batch_is_full`
+  ——下一轮预算会重置，还能再收人。
+- **`CONTINUE`** = 还有空间，继续。
+
+把两种"停止"分开是有意的：显存不够是持续状态，算力预算用完只是这一批装满了。
+混为一谈会导致高并发下永久停止接单。
+
+### ③ chunked_req 插队（3359-3361）
+
+```python
+if self.chunked_req is not None:
+    self.chunked_req.init_next_round_input()
+    self.chunked_req = adder.add_chunked_req(self.chunked_req)
+```
+
+在遍历 `waiting_queue` **之前**就塞进 `can_run_list`，绝对插队。`add_chunked_req`
+（`schedule_policy.py:1004`）里连预算都能突破：
+
+```python
+# The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+if _rem_tokens <= 0:
+    _rem_tokens = self.rem_chunk_tokens      # 预算见底也硬给一份
+```
+
+返回值决定生死：`return req if truncated else None`——还被截断说明没喂完，继续持有；
+喂完返回 `None`，`self.chunked_req` 被清空。
+
+### ④ 主循环：逐条准入（3376-3466）
+
+```python
+for req in self.waiting_queue:                 # 已被 calc_priority 排好序
+    # (a) LoRA 可调度性
+    if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+        continue
+
+    # (b) 容量检查
+    if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+        running_batch.batch_is_full = True
+    if running_batch.batch_is_full:
+        if not self.enable_priority_preemption or not adder.preempt_to_schedule(req, ...):
+            break                              # ← 抢占失败才真的停
+
+    # (c) hicache 预取
+    if self.enable_hicache_storage:
+        if not self.tree_cache.check_prefetch_progress(req.rid):
+            continue                           # ← 跳过这一个，不是停止！
+
+    # (d) 前缀匹配
+    req.init_next_round_input(self.tree_cache)
+
+    # (e) 核心准入
+    res = adder.add_one_req(req, has_chunked_req=..., truncation_align_size=...)
+
+    if res != AddReqResult.CONTINUE:
+        ...置 batch_is_full / 回收 mamba slot...
+        break
+```
+
+**`continue` 和 `break` 的区别是这个循环最容易看漏的地方**：
+
+- `continue`（a / c）= "这一个不行，看下一个"。LoRA adapter 没加载、hicache 还在从 SSD 预取
+  ——都是**个体**原因，后面的请求可能没这个问题。
+- `break`（b / e）= "全局预算到头了，后面都别看了"。队列按优先级排过，排前面的都塞不下，后面更塞不下。
+
+(d) 的 `init_next_round_input(self.tree_cache)` 去 radix cache 做**前缀匹配**：算出
+`req.prefix_indices`（能复用的 KV）和真正要 extend 的那段。这一步决定请求的"实际成本"
+——命中 90% 前缀的请求几乎不花预算。
+
+#### `add_one_req` 内部（`schedule_policy.py:1208`）
+
+```python
+# 1. 请求数硬上限
+if self.prefill_max_requests is not None and len(self.can_run_list) >= x:
+    return AddReqResult.OTHER
+
+# 2. 算总成本，先做一次无锁粗筛
+total_tokens = cand_extend_input_len + max_new + self.page_size + mamba_gap
+if total_tokens >= self.rem_total_tokens:
+    return AddReqResult.NO_TOKEN
+
+# 3. 不开 chunked prefill 时的特例
+if self.rem_chunk_tokens is None and len(self.can_run_list) != 0 and real_input_tokens >= self.rem_input_tokens:
+    return AddReqResult.OTHER
+    # 注释：if the can_run_list is empty, always accept the first prefill request
+
+# 4. 加锁后重新检查
+with self._lock_node(req.last_node):
+    if total_tokens >= self.rem_total_tokens:      # 锁内可能发生驱逐，必须重查
+        return AddReqResult.NO_TOKEN
+    ...
+    if req.needs_host_load_back():                 # 5. hicache 从 host 搬 KV 回来
+        new_indices, req.last_node = self.tree_cache.init_load_back(...)
+
+    # 6. 三条出路
+    if self.dllm_config is not None:               # dLLM 专用
+        self._add_dllm_req(req, prefix_len)
+    elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
+        req.set_extend_range(len(prefix_indices), len(full_untruncated_fill_ids))   # 整条装得下
+        self.can_run_list.append(req)
+    else:
+        trunc_len = chunk_tokens_limit // page_size * page_size                     # 装不下 → 切片
+        req.set_extend_range(len(prefix_indices), len(prefix_indices) + trunc_len)
+        self.can_run_list.append(req)
+        self.new_chunked_req = req                 # ★ 标记为新的 chunked_req
+
+return self.budget_state()
+```
+
+三个细节：
+
+- **第 3 点的"第一个请求永远接受"是防饿死的**。超长 prompt 若每次都被"超出 `max_prefill_tokens`"
+  拒绝，会永远卡在队首饿死。所以 `can_run_list` 为空时无条件接受——大不了这批只有它一个。
+- **`_lock_node` 是防自杀式驱逐**。匹配到的前缀节点在 radix tree 里，分配新 KV 时可能触发 LRU 驱逐
+  ——**可能正好驱逐掉自己刚匹配上的前缀**。`inc_lock_ref` 把它钉住。锁内要重查预算，因为驱逐会改变
+  `rem_total_tokens`。
+- **切片那条路会设 `self.new_chunked_req = req`**，这就是 `self.chunked_req` 的诞生地
+  （3479-3482 里被取走）。
+
+#### 循环尾部的 mamba 回收（3446-3462）
+
+```python
+added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+if not added:
+    req.mamba_cow_src_index = None
+    req.mamba_needs_clear = False
+    if req.mamba_pool_idx is not None and not getattr(req, "session", None):
+        self.tree_cache.req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(-1))
+```
+
+`add_one_req` 可能**先 append 再返回非 CONTINUE**（装进最后一个后预算刚好耗尽）。
+所以用 `req is can_run_list[-1]` 判断到底进没进去。没进去的话，`init_next_round_input` 里
+已分配的 mamba slot 必须还回去，否则泄漏。
+
+（这里的 `getattr(req, "session", None)` 与 `.claude/rules/no-getattr-defensive.md` 冲突，属历史遗留。）
+
+### ⑤ 收尾（3468-3551）
+
+```python
+can_run_list = adder.can_run_list
+if len(can_run_list) == 0:
+    return None, running_batch                                          # 一个都没收到
+
+can_run_set = set(can_run_list)
+self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]   # 3474 出队
+```
+
+出队用**重建列表**而不是 `remove()`——一次 O(n) 而不是 n 次 O(n)，也符合仓库 out-of-place 规则。
+
+```python
+if adder.preempt_list:                          # 被抢占的请求回队列重排
+    for req in adder.preempt_list:
+        self._add_request_to_queue(req)
+
+if adder.new_chunked_req is not None:
+    assert self.chunked_req is None             # 同时只能有一个 chunked_req
+    self.chunked_req = adder.new_chunked_req
+if self.chunked_req is not None:
+    self.chunked_req.inflight_middle_chunks += 1   # 飞行中的 chunk 计数（overlap 下用于对账）
+```
+
+然后真正建批：
+
+```python
+new_batch = ScheduleBatch.init_new(can_run_list, ..., chunked_req=self.chunked_req)   # 3490
+new_batch.contains_last_prefill_chunk = (self.chunked_req is None or len(can_run_list) != 1)
+new_batch.prepare_for_extend()                                                        # 3511 ★
+```
+
+**`prepare_for_extend()` 才是真正花钱的地方**：分配 KV slot、拼 `input_ids`、建
+`req_pool_indices` / `seq_lens` 这些并行数组、设 `forward_mode = EXTEND`。
+前面所有预算计算都只是**预测**，到这一行才落实。
+
+最后是 mixed chunk（3531-3549，见 A6）：把 `running_batch` 的 decode 请求拼进这个 extend 批一起跑，
+然后把 `running_batch` 换成空批。条件里排除了 `return_logprob`（TODO 未支持）和 `input_embeds`
+（`mix_with_running` 只 cat `input_ids`，形状对不上）。
+
+### 控制流总图
+
+```
+                         ┌─ batch_is_full / 队列空 ─────────→ None
+                         ├─ min_free_slots_delayer ────────→ None
+   四道闸 ───────────────┤─ 无可分配 req slot ──────────────→ None (+batch_is_full=True)
+                         └─ TEST_RETRACT ──────────────────→ None
+                                    │ 全部通过
+                                    ↓
+                        PrefillAdder(四类预算)
+                                    ↓
+                        chunked_req 插队（豁免一切检查）
+                                    ↓
+              ┌──── for req in waiting_queue（已按 policy 排序）
+              │         ├─ LoRA 不可调度 ──────→ continue
+              │         ├─ hicache 预取未完成 ─→ continue
+              │         ├─ 容量满 & 抢占失败 ──→ break
+              │         └─ add_one_req()
+              │              ├─ CONTINUE  → 下一个
+              │              ├─ NO_TOKEN  → batch_is_full=True, break
+              └──────────────┴─ OTHER     → break
+                                    ↓
+                        can_run_list 为空? ──→ None
+                                    ↓
+              出队 / 抢占回队 / 更新 chunked_req
+                                    ↓
+              ScheduleBatch.init_new + prepare_for_extend()   ← 真正分配 KV
+                                    ↓
+              mixed chunk? ──→ 把 running_batch 拼进来并清空
+                                    ↓
+                        return (new_batch, running_batch)
+```
