@@ -1099,3 +1099,165 @@ new_batch.prepare_for_extend()                                                  
                                     ↓
                         return (new_batch, running_batch)
 ```
+
+## A8. `PrefillAdder` 是什么、作用是什么、为什么需要（schedule_policy.py:511）
+
+一句话：`PrefillAdder` 是**单次 prefill 选批过程中的准入规划器和预算账本**。它逐个判断
+`waiting_queue` 中的请求能否加入本轮 extend batch，并记录“已选请求、剩余资源、是否要切 chunk、
+是否发生抢占”等结果。
+
+它不是模型算子，不执行 attention；也不是长期队列。每次
+`_get_new_batch_prefill_raw()` 尝试组一个新 prefill batch 时都会新建一个，用完即丢：
+
+```python
+# scheduler.py:3340
+adder = PrefillAdder(...)
+
+for req in self.waiting_queue:
+        req.init_next_round_input(self.tree_cache)  # 先算 radix/HiCache 命中
+        res = adder.add_one_req(req, ...)
+```
+
+三者的分工可以概括成：
+
+```text
+SchedulePolicy       决定 waiting_queue 的先后顺序：谁先尝试
+PrefillAdder         根据多种预算装箱：这一轮具体能收谁、收多少
+ScheduleBatch        把选中请求物化成张量并真正分配 KV，然后送去 forward
+```
+
+### 它的输入和输出
+
+构造时输入的是本轮资源快照和调度约束，主要包括：
+
+- `token_to_kv_pool_allocator`、`tree_cache`：当前可用和可驱逐的 KV 容量。
+- `running_batch`、`new_token_ratio`：已有 decode 请求未来还可能占多少 KV。
+- `rem_input_tokens`：本轮最多处理多少 prefill token，即 `max_prefill_tokens`。
+- `rem_chunk_tokens`：开启 chunked prefill 时，本轮还能处理多少 chunk token。
+- `page_size`：paged KV 分配的对齐和额外页开销。
+- SWA、Mamba、dLLM、tile budget、prefill delayer、优先级抢占等附加约束。
+
+它不会返回一个新的对象，而是把结果积累在自身字段中：
+
+| 字段 | 含义 |
+|---|---|
+| `can_run_list` | 本轮获准进入 prefill batch 的请求 |
+| `new_chunked_req` | 本轮只处理了一部分、下轮必须继续的长请求 |
+| `preempt_list` | 为高优先级请求腾位置而从 running batch 抢占的请求 |
+| `log_*_tokens` | 本轮输入 token、各层级 cache hit 等统计 |
+| 各种 `rem_*` | 加入每个请求后剩余的 KV、计算量、chunk、SWA、Mamba 等预算 |
+
+调度器消费这些结果后才真正建批：
+
+```python
+can_run_list = adder.can_run_list
+self.waiting_queue = [req for req in self.waiting_queue if req not in set(can_run_list)]
+self.chunked_req = adder.new_chunked_req  # 若本轮产生了新的半截长请求
+
+new_batch = ScheduleBatch.init_new(can_run_list, ...)
+new_batch.prepare_for_extend()            # 到这里才真正分配 KV、构造张量
+```
+
+所以 `PrefillAdder` 做的是**可行性规划**，`prepare_for_extend()` 才是**资源落实**。
+
+### 核心作用一：同时维护多维预算
+
+一个请求能不能进入 prefill batch，不能只看 batch size。它至少同时消耗：
+
+1. **当前 prefill 的 KV**：未命中 cache、这次需要 extend 的 token。
+2. **未来 decode 的 KV**：请求随后可能生成的 token，按 `new_token_ratio` 做估算。
+3. **paged allocator 余量**：每个请求额外预留一个 `page_size`，避免页对齐后超分配。
+4. **本轮计算预算**：`max_prefill_tokens` 限制一次 forward 的工作量。
+5. **chunk 预算**：长 prompt 一次只能推进一段。
+6. **特殊池预算**：混合 SWA、统一 Mamba 状态池、dLLM block 等各有独立约束。
+
+普通路径的核心估算近似为：
+
+$$
+	ext{request cost}
+= \text{uncached extend tokens}
++ \text{estimated future decode tokens}
++ \text{page overhead}
++ \text{special-pool reserve}
+$$
+
+其中 `rem_total_tokens` 关心请求从现在到生成结束的总 KV 风险，`cur_rem_tokens` 只关心本次
+extend 的峰值；两者必须同时通过。每接纳一个请求，`_update_prefill_budget()` 就立即扣减这些预算，
+因此后一个请求看到的是加入前面请求后的剩余额度。
+
+### 核心作用二：把请求变成三种明确的准入结果
+
+`add_one_req()` 最终返回 `AddReqResult`：
+
+| 结果 | 含义 | 调度器怎么处理 |
+|---|---|---|
+| `CONTINUE` | 当前请求已加入，预算还允许继续尝试 | 看下一个请求 |
+| `NO_TOKEN` | KV/状态池等内存预算不足 | 停止，并通常置 `batch_is_full = True` |
+| `OTHER` | 本轮计算量、chunk 数、请求数、delayer 等非内存限制到了 | 只结束本轮，下轮仍可重试 |
+
+区分 `NO_TOKEN` 和 `OTHER` 很重要：前者通常是持续的容量压力，后者只是这一轮的配额用完。
+若都标成 `batch_is_full`，一个仅因 `max_prefill_tokens` 暂停的请求可能以后也不再被尝试。
+
+### 核心作用三：处理普通装箱之外的状态转换
+
+`PrefillAdder` 还把几类必须与准入同步发生的操作集中起来：
+
+- **chunked prefill**：请求装不下整段时设置 `extend_range`，加入当前 batch，并通过
+    `new_chunked_req` 要求下一轮优先续上，防止长 prompt 饿死或已占资源悬空。
+- **cache 前缀保护**：用 `_lock_node()` 暂时锁住刚匹配的 radix 节点，避免分配新 KV 时把
+    自己准备复用的前缀驱逐；锁内再次检查预算。
+- **HiCache load-back**：需要时先把 host KV 恢复到 device，再按更新后的 prefix 长度计费。
+- **优先级抢占**：`preempt_to_schedule()` 计算要释放多少 running 请求才够容纳高优先级请求，
+    成功后把被抢占请求记录到 `preempt_list`，稍后重新入队。
+- **特殊模型约束**：SWA window、Mamba state、dLLM block、AMD prefill tile budget 都在同一
+    准入决策中对账，避免某个独立资源被漏算。
+
+### 为什么不能直接在 scheduler 的循环里 `append`
+
+假设只写成：
+
+```python
+for req in waiting_queue:
+        if len(batch) < max_batch_size:
+                batch.append(req)
+```
+
+会立即遇到四类问题：
+
+1. **请求成本差异巨大**：两个请求的 batch size 都是 1，但一个只需 extend 10 个 token，另一个
+     可能需要 10 万个；radix cache 命中后，同一个请求的真实成本还会动态变化。
+2. **prefill 会制造后续 decode 占用**：只保证当前 extend 放得下不够；若完全不预留未来 token，
+     下一步 decode 就可能打满 KV 池并触发大量 retract/re-prefill。
+3. **资源不是一个标量**：full KV、SWA KV、Mamba state、req slot、计算 token、chunk、tile
+     任意一个先耗尽都必须停止，单一“剩余 token”无法表达。
+4. **试选过程需要一致状态**：前一个请求被接纳后，后一个请求必须基于已经扣减的预算判断；
+     chunk、锁、load-back、抢占和统计也必须与这次接纳保持一致。
+
+把这些状态封装在一个**每轮新建的局部对象**里，还有两个直接收益：
+
+- scheduler 主流程只保留“排序 → 逐个尝试 → 消费结果 → 建批”，不会散落几十个相互依赖的计数器。
+- 每轮预算从真实 allocator/cache/running batch 重新计算，不会把上一轮已经过期的容量判断带到下一轮。
+
+### 最准确的心智模型
+
+可以把它理解成一个带多种约束的 **bin packer（装箱器）**：
+
+```text
+候选请求（已排序）
+                │
+                ▼
+    PrefillAdder
+    ├─ KV 总量够吗？
+    ├─ 当前峰值够吗？
+    ├─ prefill token 配额够吗？
+    ├─ chunk / SWA / Mamba / dLLM 配额够吗？
+    ├─ cache 节点锁住后仍够吗？
+    └─ 不够时能否切片或抢占？
+                │
+                ├─ can_run_list ─────→ 本轮 ScheduleBatch
+                ├─ new_chunked_req ──→ 下轮优先续跑
+                └─ preempt_list ─────→ 重新进入等待队列
+```
+
+因此它之所以需要存在，本质上是为了在真正分配 KV 之前回答一个问题：
+**“按当前 cache 命中、运行中请求和各类资源约束，这一轮最多可以安全地 prefill 哪些请求？”**
