@@ -1,4 +1,32 @@
-# get_next_batch_to_run 分析（2026-09-16）
+# SGLang Scheduler 学习笔记（2026-09-16 起）
+
+主线是 `get_next_batch_to_run`，逐个概念的追问收在附录，进程拓扑放在最后。
+所有行号对应 `study/2026-08-26` 分支当时的代码。
+
+## 目录
+
+| 章节 | 内容 |
+|---|---|
+| 第一部分 | `get_next_batch_to_run` 主干：事件循环、四段拆解、三个变体 |
+| 附录 A1-A8 | 逐点追问记录 |
+| 第二部分 | Scheduler 进程数量怎么定、请求怎么分配到各 Scheduler |
+
+附录索引：
+
+| | 主题 | 一句话 |
+|---|---|---|
+| A1 | `forward_mode.is_extend()` | batch 的前向类型标签，九种模式的判定 |
+| A2 | decode 时 `last_batch` 就是 `running_batch` | 对象身份，门卫存在的根本原因 |
+| A3 | `chunked_req_to_exclude` | 不许毕业进 decode 的黑名单 |
+| A4 | `filter_batch()` | 并行数组的收割器，不做会踩已释放的 slot |
+| A5 | prefill-only 跳过 decode | `max_new_tokens == 0`，prefill 那步就 finished |
+| A6 | `batch_to_run` vs `running_batch` | 瞬时动作 vs 持久状态 |
+| A7 | `_get_new_batch_prefill_raw` | prefill 准入五阶段详解 |
+| A8 | `PrefillAdder` | 多维约束的装箱器 |
+
+---
+
+# 第一部分：get_next_batch_to_run 主干
 
 ## 0. 位置
 
@@ -230,7 +258,7 @@ else:
 
 ---
 
-# 附录：逐点追问记录
+# 附录：逐点追问记录（A1-A8）
 
 ## A1. `last_batch.forward_mode.is_extend()` 代表什么（scheduler.py:3150）
 
@@ -1261,3 +1289,254 @@ for req in waiting_queue:
 
 因此它之所以需要存在，本质上是为了在真正分配 KV 之前回答一个问题：
 **“按当前 cache 命中、运行中请求和各类资源约束，这一轮最多可以安全地 prefill 哪些请求？”**
+
+---
+
+# 第二部分：Scheduler 进程数量与请求分配
+
+前面全在讲**一个 Scheduler 进程内部**怎么调度。这部分讲上游：一共起几个 Scheduler、
+它们各自负责哪张卡、请求又是怎么分到它们手上的。
+
+## B1. 核心结论：一个 Scheduler 进程 = 一张 GPU
+
+Scheduler 不是"一个"，是一组。每张参与推理的 GPU 对应一个独立的 Scheduler 进程，
+各自持有自己的 `waiting_queue` / `running_batch` / `TpModelWorker` / `ModelRunner`。
+
+数量公式分两种模式：
+
+### 模式 A：经典 DP（不开 `--enable-dp-attention`）
+
+```
+Scheduler 进程总数 = dp_size × pp_size × tp_size
+```
+
+每个 DP replica 是**一份完整的模型副本**，各自独占 `tp_size × pp_size` 张卡，互不通信。
+`launch_dp_schedulers`（`data_parallel_controller.py:372`）循环 `dp_size` 次，每次把起始卡号往后推：
+
+```python
+for dp_rank in range(get_parallel().dp_size):
+    thread = threading.Thread(target=self.launch_tensor_parallel_group_thread,
+                              args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event))
+    base_gpu_id += server_args.tp_size * configured_pp_size() * server_args.gpu_id_step   # 397
+```
+
+### 模式 B：DP attention（`--enable-dp-attention`）
+
+```
+Scheduler 进程总数 = pp_size × tp_size        ← dp_size 不再是乘数！
+约束：tp_size % (dp_size × attn_cp_size) == 0          （server_args.py:6992）
+派生：attn_tp_size = tp_size // dp_size // attn_cp_size
+```
+
+这里 `dp_size` 是**切分** `tp_size` 而不是复制它——`tp_size` 就是 world size。
+attention 部分按 DP 切（每个 DP group 独立处理自己那批请求），MoE/MLP 部分仍按全局 TP/EP 切。
+`launch_dp_attention_schedulers`（`data_parallel_controller.py:554`）最后只调**一次**
+`launch_tensor_parallel_group(..., base_gpu_id=0, dp_rank=None, ...)`，起 `tp × pp` 个进程。
+
+server_args 里的这句注释点破了关键：
+
+> The tp_size is the world size, not the real tensor parallel size  （`server_args.py:6987`）
+
+## B2. 谁来创建这些进程
+
+`Engine._launch_scheduler_processes`（`entrypoints/engine.py:818`）是分叉点：
+
+```python
+use_dp_controller = (get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale")   # 834
+
+if not use_dp_controller:
+    # 直接 fork 出 tp × pp 个 Scheduler 进程
+    pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = _calculate_rank_ranges(...)
+    for pp_rank in pp_rank_range:
+        for tp_rank in tp_rank_range:
+            gpu_id = (server_args.base_gpu_id
+                      + (pp_rank % pp_size_per_node) * tp_size_per_node
+                      + (tp_rank % tp_size_per_node) * server_args.gpu_id_step)          # 857
+            mp.Process(target=run_scheduler_process_func,
+                       args=(server_args, port_args, gpu_id, tp_rank,
+                             attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, None, writer)).start()
+else:
+    # 只 fork 一个 DataParallelController，由它再去 fork 所有 Scheduler
+    mp.Process(target=run_data_parallel_controller_process, kwargs=dict(...)).start()
+```
+
+所以进程拓扑有两种形状：
+
+```
+dp_size == 1:
+    TokenizerManager ──ZMQ──→ Scheduler(tp0) ─┐
+                                Scheduler(tp1)  ├ 同一 TP 组，rank0 收后广播
+                                Scheduler(tp2)  │
+                                Scheduler(tp3) ─┘
+
+dp_size > 1:
+    TokenizerManager ──ZMQ──→ DataParallelController ──ZMQ PUSH──→ DP0 的 Scheduler 组
+                                     (多一层进程)      ├──────────→ DP1 的 Scheduler 组
+                                                       └──────────→ DP2 的 Scheduler 组
+```
+
+## B3. 多机怎么分（`_calculate_rank_ranges`，engine.py:1805）
+
+每个节点只起属于自己的那部分 rank：
+
+```python
+pp_size_per_node    = max(pp_size // nnodes, 1)
+nnodes_per_pp_rank  = max(nnodes // pp_size, 1)
+pp_rank_range = range(pp_size_per_node * (node_rank // nnodes_per_pp_rank),
+                      pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1))
+
+nnodes_per_tp_group = nnodes_per_pp_rank
+tp_size_per_node    = tp_size // nnodes_per_tp_group
+tp_rank_range = range(tp_size_per_node * (node_rank % nnodes_per_tp_group),
+                      tp_size_per_node * (node_rank % nnodes_per_tp_group + 1))
+```
+
+两个典型例子：
+
+**`--tp 16 --nnodes 2`（一个 TP 组横跨两机）**
+
+| | `nnodes_per_tp_group` | `tp_size_per_node` | node 0 | node 1 |
+|---|---|---|---|---|
+| | 2 | 8 | `tp_rank` 0-7 | `tp_rank` 8-15 |
+
+**`--tp 8 --pp 2 --nnodes 2`（每机一个 PP stage）**
+
+| | `pp_size_per_node` | `nnodes_per_pp_rank` | node 0 | node 1 |
+|---|---|---|---|---|
+| | 1 | 1 | `pp_rank`=0, `tp_rank` 0-7 | `pp_rank`=1, `tp_rank` 0-7 |
+
+注意第二个例子里两台机器的 `tp_rank` 都是 0-7——`tp_rank` 是**组内**编号，不是全局编号。
+全局位置由 `(pp_rank, tp_rank)` 这个二元组确定。
+
+## B4. 请求分配：两级分发
+
+一个请求从 TokenizerManager 出发，要经过最多两级才落到具体的 Scheduler 上。
+
+```
+TokenizerManager
+      │  ZMQ PUSH（TokenizedGenerateReqInput）
+      ↓
+┌─────────────────────────────────────────┐
+│ 第一级：DataParallelController          │  仅 dp_size > 1 时存在
+│   四种 LoadBalanceMethod 选一个 DP rank │  进程间，ZMQ PUSH
+└─────────────────────────────────────────┘
+      │
+      ↓  送到该 DP replica 的 tp_rank 0
+┌─────────────────────────────────────────┐
+│ 第二级：TP rank 0 收，广播给同组其它 rank│  组内，gloo broadcast_pyobj
+└─────────────────────────────────────────┘
+      │
+      ↓
+  该组每个 Scheduler 都拿到一模一样的请求列表
+```
+
+### 第一级：DP controller 的四种策略
+
+`LoadBalanceMethod`（`data_parallel_controller.py:88`）：
+
+| 策略 | 实现 | 做法 | 默认用在 |
+|---|---|---|---|
+| `round_robin` | :762 | 在**活跃** worker 里轮询，跳过不可用的 | 非 PD、PD decode |
+| `follow_bootstrap_room` | :783 | `bootstrap_room % len(workers)` | PD prefill |
+| `total_requests` | :794 | 选 `running + waiting` 请求数最少的 | — |
+| `total_tokens` | :800 | 选 token 数最少的，请求数做 tie-break | — |
+
+`--load-balance-method auto`（默认）的解析在 `_handle_load_balance_method`
+（`server_args.py:4238`）：PD prefill → `follow_bootstrap_room`，其余一律 `round_robin`。
+
+`follow_bootstrap_room` 用取模而不是负载，是因为 PD 分离下**同一个请求的 P 侧和 D 侧必须落在配对的 rank 上**
+——KV 要从那个 prefill 节点传到那个 decode 节点，随机分配会对不上。确定性哈希是硬要求，不是优化。
+
+后两种依赖 `DPBudget`（:105），负载数据不是实时 RPC 查的，而是从**共享内存快照**读
+（`load_snapshot_reader`），并且带一个本地启发式：
+
+```python
+def dispatch(self, method, estimated_tokens=0):
+    ...
+    # Increment the load of that worker by one as a heuristic
+    self.total_requests[target_rank] += 1                 # 136
+    self.total_tokens[target_rank] += estimated_tokens
+```
+
+派完一个就先在本地把它的负载加上去，否则同一批请求会因为读到同一份快照而全打到同一个 rank。
+
+还有一个绕过所有策略的口子——`maybe_external_dp_rank_routing`（:747）：
+
+```python
+if req.routed_dp_rank is not None:
+    sock_send(self.workers[req.routed_dp_rank], req)    # 外部 router 已经决策过，直接送
+    return True
+```
+
+### 第二级：TP rank 0 收，广播给同组
+
+同一 TP 组内的 `tp_size` 个 Scheduler 必须做出**完全相同**的调度决策——否则各 rank 组的 batch
+形状不一致，forward 里的 all-reduce 直接对不上。做法不是让每个 rank 各自收请求再指望它们一致，
+而是**只让一个 rank 收，然后广播**。
+
+`_pull_raw_reqs`（`scheduler_components/request_receiver.py:104`）：
+
+```python
+if self.ps.pp_rank == 0:
+    if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+        recv_reqs = [...从 zmq 非阻塞拉干净...]
+    else:
+        recv_reqs = None                       # 其它 rank 什么都不收
+else:
+    # PP 非首段：从上一个 PP stage 点对点接收
+    recv_reqs = point_to_point_pyobj(..., src=(pp_rank-1)*tp_size+dp_offset, ...)
+```
+
+`_broadcast_reqs_across_ranks`（:153）：
+
+```python
+if enable_dp_attention:
+    work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
+    work_reqs    = broadcast_pyobj(work_reqs,    src=attn_tp_group.ranks[0])   # 只在本 DP 组内
+    control_reqs = broadcast_pyobj(control_reqs, src=tp_group.ranks[0])        # 走全 tp_group
+    recv_reqs = work_reqs + control_reqs
+elif self.ps.tp_size != 1:
+    recv_reqs = broadcast_pyobj(recv_reqs, src=tp_group.ranks[0])              # 全 tp_group
+```
+
+**work req 和 control req 分开走**是这里的关键设计：
+
+- **work req**（真正的推理请求）：DP attention 下每个 DP group 有自己的请求流，
+  只需要在 `attn_tp_group` 内广播。
+- **control req**（profile、权重更新、block/unblock）：所有 rank 都得收到，必须走全 `tp_group`。
+
+除非开了 `--enable-dp-attention-local-control-broadcast`——那时 DP controller 会给**每个** group leader
+都发一份控制消息（`control_message_step = 1`，`data_parallel_controller.py:215`），
+于是控制消息也能只在本组广播，省掉一次昂贵的全局 gloo 同步：
+
+```python
+def send_control_message(self, obj):
+    for i in self._active_workers[:: self.control_message_step]:   # step=1 每个都发；step=tp_size 只发 leader
+        sock_send(self.workers[i], obj)
+```
+
+这就是 `study/LOG_9_10` 那张图里"`waiting_queue` / `running_batch` 内容完全一样"的代码依据——
+不是巧合，是 rank 0 广播出来的同一份数据。
+
+## B5. 三个"rank"别搞混
+
+| 名字 | 含义 | 谁在用 |
+|---|---|---|
+| `tp_rank` | TP 组内编号，0 ~ `tp_size-1` | 决定 gpu_id、是否负责收 ZMQ |
+| `attn_tp_rank` | DP attention 下 attention TP 组内编号 | 决定是否负责收 work req |
+| `dp_rank` | 第几个 DP replica（经典 DP）/ 第几个 attention DP group | DP controller 路由的目标 |
+| `pp_rank` | 流水线第几段 | 只有 `pp_rank == 0` 从 ZMQ 收，其余从上一段点对点收 |
+
+注意收请求的判据是 `attn_tp_rank == 0 and attn_cp_rank == 0`，**不是** `tp_rank == 0`。
+经典模式下两者等价；DP attention 下每个 DP group 都有自己的 `attn_tp_rank == 0`，各收各的。
+
+## B6. 一张总表
+
+以 `--tp 8 --dp 2 --pp 1` 为例：
+
+| 配置 | Scheduler 进程数 | GPU 数 | 拓扑 |
+|---|---|---|---|
+| 不开 dp attention | 2 × 1 × 8 = **16** | 16 | 两份完整模型副本，各占 8 卡 |
+| 开 dp attention | 1 × 8 = **8** | 8 | 一份模型，attention 切成 2 个 DP group，每组 attn_tp=4 |
+
+同样写 `--dp 2`，开不开 `--enable-dp-attention` 差出一倍的卡——这是最容易踩的坑。
